@@ -1,0 +1,347 @@
+---
+title: "SIR_ER_Network"
+author: "Ananyo Shreya"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+
+# Short overview: Erdos-Renyi (ER) network
+
+An Erdos-Renyi (ER) random graph is one of the simplest network models. In the  variant, we fix the number of nodes `n` and include every possible edge independently with probability `p` known as $G(n,p)$.
+
+## Pseudo Algorithm
+
+
+\begin{itemize}
+    \item[Step 1] Set a seed. Fix number of nodes $n$(we have taken n=80).
+    \item[Step 2] Generate $U_1,\dots, U_{n(n-1)/2}$ many uniform random variables independently.
+    \item[Step 3] Randomly select $1$ node and define its state to be \texttt{Infected}, others are \texttt{Susceptible}. We have taken number of \texttt{Recovered} person $0$ initially.
+    \item[Step 4] Take a sequence of probabilities (the same probability attached to the edges in ER network) and for each probability construct adjacency matrix by comparing uniform observations with probability to generate an ER network.
+    \item[Step 5] Run a SIR model on this network with fixed recovery and infection rates until there are no infected people (We have taken recovery rate = $0.25$ and different $R_0$ values). Store the 4 measures : \texttt{Total number of infected people}, \texttt{Maximum number of newly infected people on a single day}, \texttt{Day of Maximum Infection}, and \texttt{Duration of epidemic}.
+    \item[Step 6] Repeat Step 5 several times (We did 10 times).
+    \item[Step 7] Repeat Step 2 to 6 several times (We did 15 times) and obtain mean and standard deviations for the 4 measures at each probability using those 250 values in each case. Then plot the means with respective $95\%$ confidence interval for various probabilities while keeping other parameters intact.
+    \item[Step 8] We have repeated each of the plots for some values of $R_0 $ (Mentioned later) and plotted all in a single frame in each case for easy comparison.
+    \item[Step 9] We have also obtained the threshold probability for each $R_0$ which will lead to the event that at least $95\%$ of the population gets infected and another threshold probability for each $R_0$ that caused longest span from starting day of epidemic to cause maximum new infection on a day.
+    
+\end{itemize}
+
+```{r echo=FALSE, message=FALSE}
+library(knitr)
+
+data.frame(
+  Label = c("Exp. 1", "Exp. 2", "Exp. 3"),
+  Experiment_Design = c(
+    "Monofactorial experiment with focus on change in connection probability in ER network",
+    "Monofactorial experiment to investigate the effect of changes in the value of R0",
+    "Full factorial experiment to study the impact of interactions between parameters"
+  ),
+  Connection_Prob = c(
+    "0.001, 0.005, 0.008, 0.01, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.12, 0.14, 0.16, 0.18, 0.25, 0.3, 0.4, 0.5, 0.7, 0.8, 0.9, 0.97",
+    "0.3",
+    "0.001, 0.005, 0.008, 0.01, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.12, 0.14, 0.16, 0.18, 0.25, 0.3, 0.4, 0.5, 0.7, 0.8, 0.9, 0.97"
+  ),
+  R0 = c("0.8", "0.5, 0.65, 0.8, 1.0, 1.2", "0.5, 0.65, 0.8, 1.0, 1.2"),
+  Recovery_Rate = c("0.25", "0.25", "0.25")
+) |> 
+  kable(format = "markdown", align = "lclcc", caption = "Experimental Design Summary")
+```
+
+ 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(foreach)
+library(doParallel)
+library(gridExtra)
+library(tergm)
+library(deSolve)
+library(network)
+library(EpiModel)
+library(patchwork)
+set.seed(123456789)
+```
+
+
+
+```{r,echo=TRUE}
+# 1. Function to create Erdos-Renyi Network
+er_graph_unif <- function(p, nodes, unif_matrix){
+  adj_matrix <- matrix(0, nrow= nodes, ncol=nodes)
+  adj_matrix[which(unif_matrix <= p)] <- 1
+  er_graph <- graph_from_adjacency_matrix(adj_matrix, mode="undirected")
+  return(er_graph)
+}
+
+# 2. Function for SIR model
+SIR <- function(states, er_network, infection_rate, recovery_day){
+  new_inf_vector <- c()
+  start_day <- rep(-1,length(states))
+  start_day[which(states == "I")] <- 0
+  t=1
+  while (sum(states == "I") != 0){
+    # infection process
+    new_infected <- c()
+    infected_nodes <- which(states == "I")
+    for (i in infected_nodes){
+      neighbors_i <- neighbors(er_network, i)
+      s_neighbors <- neighbors_i[states[neighbors_i] == "S"]
+      for (s_node in s_neighbors){
+        if (runif(1) < infection_rate){
+          states[s_node] <- "I"
+          new_infected <- c(new_infected, s_node)
+        }
+      }
+    }
+    start_day[new_infected] <- t
+    new_inf_vector <- c(new_inf_vector, length(new_infected))
+    
+    # recovery process
+    if (t>=recovery_day){
+      recovered <- which(start_day == t-recovery_day)
+      states[recovered] <- "R"
+    }
+    
+    t <- t+1
+  }
+  total_inf <- sum(states == "R")
+  max_inf <- max(new_inf_vector)
+  peak_day <- min(which(new_inf_vector == max_inf))
+  end_day <- t
+  
+  return(c(total_inf/length(states), max_inf/length(states), peak_day, end_day))
+}
+
+
+# 3. Function for each simulation
+Evaluation <- function(nodes, probs, beta, gamma, initial_infected){
+  #Uniform numbers generation for a simulation
+  unif_matrix <- matrix(0, nodes, nodes)
+  unif_matrix[lower.tri(unif_matrix, diag = FALSE)] <- runif((nodes*(nodes-1))/2)
+  unif_matrix <- unif_matrix +t(unif_matrix)
+  unif_matrix[which(unif_matrix==0)] <- 1
+  
+  all_sir <- list()
+  for (l in 1:10){
+    # initial states of nodes for a simulation
+    states <- rep("S", nodes)
+    states[initial_infected] <- "I"
+    vec_measures <- matrix(nrow=0, ncol=4)
+    for (b in beta){
+      for (p in probs){
+        er_graph <- er_graph_unif(p, nodes, unif_matrix) #Erdos Renyi graph
+        values <- SIR(states, er_graph, b, gamma)
+        vec_measures <- rbind(vec_measures, values)
+      }
+    }
+    all_sir[[l]] <- vec_measures
+  }
+  return(list(list = all_sir, matrix = unif_matrix))
+}
+
+
+# 4. Function for generating summary measures
+Simulated_df <- function(sim,nodes, probs, beta, gamma, initial_infected, probs1, beta1){
+  
+  result <- lapply(1:sim, function(x) Evaluation(nodes, probs, beta, gamma, initial_infected))
+  
+  # Extract all lists
+  mat_list <- lapply(result, function(x) x$list)
+  
+  mat_array <- array(unlist(mat_list), dim = c(length(beta)*length(probs), 4, sim*10))
+  
+  mean_matrix <- apply(mat_array, c(1, 2), mean, na.rm = TRUE)
+  lower_matrix <- apply(mat_array, c(1, 2), function(x) quantile(x, 0.025, na.rm = TRUE))
+  upper_matrix <- apply(mat_array, c(1, 2), function(x) quantile(x, 0.975, na.rm = TRUE))
+  
+  num_r0 <- length(beta)
+  split_indices <- split(1:(length(probs) * num_r0), rep(1:num_r0, each=length(probs)))
+  mean_list <- lapply(split_indices, function(idx) mean_matrix[idx, ])
+  lower_list <- lapply(split_indices, function(idx) lower_matrix[idx, ])
+  upper_list <- lapply(split_indices, function(idx) upper_matrix[idx, ])
+  
+  
+  #Total infected
+  df_total_inf <- data.frame()
+  for (i in 1:num_r0){
+    df_temp <- data.frame(
+      Probs = probs,
+      R0 = beta[i],
+      Mean = mean_list[[i]][,1],
+      Upper = upper_list[[i]][,1],
+      Lower = lower_list[[i]][,1]
+    )
+    df_total_inf <- rbind(df_total_inf, df_temp)
+  }
+  
+  #Max infected
+  df_max_inf <- data.frame()
+  for (i in 1:num_r0){
+    df_temp <- data.frame(
+      Probs = probs,
+      R0 = beta[i],
+      Mean = mean_list[[i]][,2],
+      Upper = upper_list[[i]][,2],
+      Lower = lower_list[[i]][,2]
+    )
+    df_max_inf <- rbind(df_max_inf, df_temp)
+  }
+  
+  #Peak day
+  df_peak_day <- data.frame()
+  for (i in 1:num_r0){
+    df_temp <- data.frame(
+      Probs = probs,
+      R0 = beta[i],
+      Mean = mean_list[[i]][,3],
+      Upper = upper_list[[i]][,3],
+      Lower = lower_list[[i]][,3]
+    )
+    df_peak_day <- rbind(df_peak_day, df_temp)
+  }
+  
+  #End day
+  df_end_day <- data.frame()
+  for (i in 1:num_r0){
+    df_temp <- data.frame(
+      Probs = probs,
+      R0 = beta[i],
+      Mean = mean_list[[i]][,4],
+      Upper = upper_list[[i]][,4],
+      Lower = lower_list[[i]][,4]
+    )
+    df_end_day <- rbind(df_end_day, df_temp)
+  }
+  
+  D <- list(
+    total_inf = df_total_inf,
+    max_inf = df_max_inf,
+    peak = df_peak_day,
+    end = df_end_day
+  )
+  
+  return(D)
+}
+```
+
+## Parameter Initializations
+
+```{r simulate,echo=TRUE}
+### Now comes the main code:
+nodes <- 80
+probs <- c(0.001, 0.005, 0.008, 0.01, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1,
+            0.12, 0.14, 0.16, 0.18,0.25, 0.3, 0.4, 0.5, 0.7, 0.8, 0.9, 0.97)
+beta <- c(0.125, 0.1625,0.2,0.25,0.3) # Infection rate
+initial <- 1
+initial_infected <- sample(1:nodes, initial)
+
+sim <- 15 #No of simulations
+
+probs1 <- c(0.75,0.9,0.97)
+beta1 <- c(0.25,0.3)
+
+sim_df1 <- Simulated_df(sim, nodes, probs, beta, recovery_day=4, initial_infected, probs1, beta1)
+
+```
+
+
+## Plots and Observations
+
+We compute mean and $95\%$ confidence intervals across simulations for each `p` and plot.
+
+```{r,fig.cap="Total Proportion of Infected Curve with Confidence Interval (Fixed Case)",echo=FALSE}
+#Plot for Total infected
+ggplot(sim_df1$total_inf, aes(x = Probs, y = Mean, color = factor(R0), fill = factor(R0))) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.3, color = NA) +
+  geom_line(size = 0.8) +
+  scale_color_brewer(name = "Beta", palette = "Set1") +
+  scale_fill_brewer(name = "Beta", palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Total Proportion of Infected Curve with Confidence Interval",
+       x = "Connection Probability",
+       y = "Total Proportion of Infected")
+
+```
+
+
+
+```{r,fig.cap="Maximum Proportion of Infection on a day Curve with Confidence Interval (Fixed Case)",echo=FALSE}
+#Plot for Max infected
+ggplot(sim_df1$max_inf, aes(x = Probs, y = Mean, color = factor(R0), fill = factor(R0))) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.3, color = NA) +
+  geom_line(size = 0.8) +
+  scale_color_brewer(name = "Beta", palette = "Set1") +
+  scale_fill_brewer(name = "Beta", palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Maximum Proportion of new infection on a day Curve with Confidence Interval",
+       x = "Connection Probability",
+       y = "Maximum Proportion of new infection")
+
+```
+
+```{r,fig.cap="Day of maximum infection Curve with Confidence Interval (Fixed Case)",echo=FALSE}
+#Plot for Peak day
+ggplot(sim_df1$peak, aes(x = Probs, y = Mean, color = factor(R0), fill = factor(R0))) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.3, color = NA) +
+  geom_line(size = 0.8) +
+  scale_color_brewer(name = "Beta", palette = "Set1") +
+  scale_fill_brewer(name = "Beta", palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Day of maximum infection Curve with Confidence Interval",
+       x = "Connection Probability",
+       y = "Day of maximum infection")
+
+```
+
+
+```{r,fig.cap="Epidemic duration with Confidence Interval (Fixed Case)",echo=FALSE}
+#Plot for End day
+ggplot(sim_df1$end, aes(x = Probs, y = Mean, color = factor(R0), fill = factor(R0))) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.3, color = NA) +
+  geom_line(size = 0.8) +
+  scale_color_brewer(name = "Beta", palette = "Set1") +
+  scale_fill_brewer(name = "Beta", palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Total time for epidemic with Confidence Interval",
+       x = "Connection Probability",
+       y = "Epidemic duration")
+
+```
+
+
+
+```{r, echo=FALSE}
+maxp1 <- c()
+for(i in 1:length(beta)){
+  d1 <- sim_df1$total_inf[((i-1)*length(probs)+1):(i*length(probs)),]
+  maxp1 <- c(maxp1, d1$Probs[min(which(d1$Mean>= 0.95))])
+}
+threshold_p_95_infection1 <- data.frame(Beta = beta, p = maxp1)
+```
+
+\subsubsection*{Threshold Value of probability exceeding which $95\%$ of the individuals got infected for every $\beta$}
+
+```{r, echo=FALSE}
+print(threshold_p_95_infection1)
+```
+
+```{r, echo=FALSE}
+maxp1 <- c()
+for(i in 1:length(beta)){
+  d1 <- sim_df1$peak[((i-1)*length(probs)+1):(i*length(probs)),]
+  maxp1 <- c(maxp1, d1$Probs[which(d1$Mean== max(d1$Mean))])
+}
+
+threshold_p_day_max_infection1 <- data.frame(Beta = beta, p = maxp1)
+```
+
+\subsubsection*{Threshold Value of probability at which day of maximum infection peaked for every $\beta$}
+
+```{r, echo=FALSE}
+print(threshold_p_day_max_infection1)
+```
